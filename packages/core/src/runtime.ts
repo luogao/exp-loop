@@ -60,7 +60,7 @@ export function createExpLoop(config: ExpLoopConfig): ExpLoopRuntime {
       };
       await episodeStore.save(episode);
 
-      const candidates = await extractor.extract(episode);
+      const candidates = (await extractor.extract(episode)).map(normalizeCandidate);
 
       const existingExps = await experienceStore.list();
       const newExperiences: Experience[] = [];
@@ -154,5 +154,25 @@ function candidateToExperience(
     status: "active",
     createdAt: now,
     updatedAt: now,
+  };
+}
+
+function ensureArray(val: unknown): string[] {
+  if (Array.isArray(val)) return val;
+  if (typeof val === "string") return [val];
+  return [];
+}
+
+function normalizeCandidate(
+  candidate: ExperienceCandidate,
+): ExperienceCandidate {
+  return {
+    ...candidate,
+    triggers: ensureArray(candidate.triggers),
+    applyWhen: ensureArray(candidate.applyWhen),
+    avoid: ensureArray(candidate.avoid),
+    evidence: ensureArray(candidate.evidence),
+    confidence:
+      typeof candidate.confidence === "number" ? candidate.confidence : 0.5,
   };
 }

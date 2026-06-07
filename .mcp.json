@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "exp-loop": {
+      "command": "node",
+      "args": ["packages/adapter-mcp/dist/bin.js"],
+      "env": {
+        "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}",
+        "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
+        "EXP_LOOP_DATA_DIR": ".exp-loop"
+      }
+    }
+  }
+}
