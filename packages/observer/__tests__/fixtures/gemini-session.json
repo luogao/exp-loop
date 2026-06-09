@@ -1,0 +1,28 @@
+{
+  "sessionId": "gemini-session-1",
+  "startTime": "2026-06-01T10:00:00.000Z",
+  "lastUpdated": "2026-06-01T10:05:00.000Z",
+  "messages": [
+    {
+      "id": "msg1",
+      "type": "user",
+      "content": "Explain this function",
+      "timestamp": "2026-06-01T10:00:01.000Z"
+    },
+    {
+      "id": "msg2",
+      "type": "gemini",
+      "content": "This function calculates the factorial of a number.",
+      "timestamp": "2026-06-01T10:00:05.000Z",
+      "toolCalls": [
+        {"name": "read_file"}
+      ]
+    },
+    {
+      "id": "msg3",
+      "type": "info",
+      "content": "System info message",
+      "timestamp": "2026-06-01T10:00:06.000Z"
+    }
+  ]
+}

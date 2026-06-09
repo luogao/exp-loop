@@ -12,6 +12,8 @@
   "dependencies": {
     "@exp-loop/core": "workspace:*",
     "@exp-loop/store-fs": "workspace:*",
+    "@exp-loop/observer": "workspace:*",
+    "@exp-loop/syncer": "workspace:*",
     "commander": "^13.0.0"
   },
   "files": ["dist"]

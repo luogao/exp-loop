@@ -1,0 +1,3 @@
+{"type":"user","message":{"role":"user","content":"Run the tests"},"timestamp":"2026-06-01T13:00:00.000Z","isSidechain":true}
+{"type":"user","message":{"role":"user","content":"Build the project"},"timestamp":"2026-06-01T13:00:01.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I encountered an error while building. The build failed due to a missing dependency."}]},"timestamp":"2026-06-01T13:00:05.000Z"}

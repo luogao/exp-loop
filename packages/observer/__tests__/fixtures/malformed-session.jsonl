@@ -1,0 +1,5 @@
+{"type":"permission-mode","mode":"auto","timestamp":"2026-06-01T11:00:00.000Z"}
+not valid json at all
+{"type":"user","message":{"role":"user","content":"Deploy the app"},"timestamp":"2026-06-01T11:00:01.000Z"}
+{"type":"unknown_future_type","data":"something new","timestamp":"2026-06-01T11:00:02.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Let me think about this..."},{"type":"text","text":"I'll deploy the app now."}]},"timestamp":"2026-06-01T11:00:03.000Z"}

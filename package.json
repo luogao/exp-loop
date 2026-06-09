@@ -3,11 +3,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "pnpm -r run build",
+    "build": "pnpm -r --filter '!@exp-loop/desktop' run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint packages/*/src",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b",
+    "desktop:prepare": "pnpm build && pnpm --filter @exp-loop/desktop prepare-sidecar",
+    "desktop:dev": "pnpm desktop:prepare && pnpm --filter @exp-loop/desktop tauri:dev",
+    "desktop:build": "pnpm desktop:prepare && pnpm --filter @exp-loop/desktop tauri:build"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

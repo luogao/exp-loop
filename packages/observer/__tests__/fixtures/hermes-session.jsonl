@@ -1,0 +1,4 @@
+{"type":"session","id":"hermes-session-1","title":"Debug API","cwd":"/Users/test/api","timestamp":"2026-06-01T10:00:00.000Z"}
+{"type":"message","message":{"role":"user","content":"Why is the API returning 500?"},"timestamp":"2026-06-01T10:00:01.000Z"}
+{"type":"message","message":{"role":"assistant","content":"Let me check the server logs."},"timestamp":"2026-06-01T10:00:05.000Z"}
+{"type":"message","message":{"role":"assistant","content":"Found the issue — a null pointer in the handler."},"timestamp":"2026-06-01T10:00:10.000Z"}
