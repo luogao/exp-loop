@@ -38,6 +38,7 @@ function makeStores(experiences: Experience[], skills: SkillSummary[]): {
       async list(query?: ExpListQuery) {
         return experiences.filter((e) => {
           if (query?.status && e.status !== query.status) return false;
+          if (query?.scope && e.scope !== query.scope) return false;
           return true;
         });
       },

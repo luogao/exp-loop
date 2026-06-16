@@ -37,21 +37,14 @@ export function createClaudeMdSyncer(
         : join(opts.projectRoot ?? process.cwd(), projectFileName);
 
     const scopeFilter =
-      opts.scope === "global" ? "global" : undefined;
+      opts.scope === "global" ? "global" : "project";
 
     const experiences = await stores.experienceStore.list({
       status: "active",
-      scope: scopeFilter as "global" | undefined,
+      scope: scopeFilter,
     });
 
-    const filtered =
-      opts.scope === "global"
-        ? experiences.filter((e) => e.scope === "global")
-        : experiences.filter(
-            (e) => e.scope === "project" || e.scope === "domain",
-          );
-
-    const topExperiences = filtered
+    const topExperiences = experiences
       .sort((a, b) => b.confidence - a.confidence)
       .slice(0, maxExperiences);
 

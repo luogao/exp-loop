@@ -136,10 +136,13 @@ program
 program
   .command("sync")
   .description("Sync learned knowledge to CLAUDE.md")
-  .option("--scope <scope>", "Sync scope: global, project, or all", "all")
-  .option("--project <path>", "Project root for project-scope sync")
+  .option("--scope <scope>", "Sync scope: global, project, or all", "project")
+  .option("--project <path>", "Project root for project-scope sync (default: cwd)")
+  .option("--data-dir <path>", "Data directory (default: ~/.exp-loop — where watch stores experiences)")
   .action(async (opts) => {
-    const dataDir = resolveDataDir(opts.project);
+    // Read from ~/.exp-loop by default — that's where `watch` writes experiences.
+    // (resolveDataDir points at <project>/.exp-loop, which is a different, legacy location.)
+    const dataDir = opts.dataDir || resolve(homedir(), ".exp-loop");
     const stores = createFileSystemStores(dataDir);
 
     const syncer = createClaudeMdSyncer({}, stores);
@@ -419,15 +422,19 @@ program
 // ─── dedupe ─────────────────────────────────────────
 program
   .command("dedupe")
-  .description("Merge duplicate experiences (similar title/triggers/recommendation) within a scope")
+  .description("Merge duplicate experiences within a scope")
   .option("--data-dir <path>", "Data directory (default: ~/.exp-loop)")
   .option("--scope <scope>", "Scope to dedupe: global, domain, project, or all", "project")
-  .option("--threshold <n>", "Similarity threshold (0-1, default 0.32)", parseFloat)
+  .option("--threshold <n>", "Lexical similarity threshold 0-1 (default 0.32, lexical mode only)", parseFloat)
+  .option("--semantic", "Use LLM to group paraphrased duplicates (lexical cannot). Calls the LLM once per scope.")
   .option("--apply", "Actually merge (default: dry-run, just report)")
   .action(async (opts) => {
     const dataDir = opts.dataDir || resolve(homedir(), ".exp-loop");
     const threshold = opts.threshold ?? SIMILARITY_THRESHOLD;
     const stores = createFileSystemStores(dataDir);
+
+    // Semantic mode needs the LLM.
+    const semanticLlm = opts.semantic ? await createLlm() : null;
 
     const scopes =
       opts.scope === "all" ? ["global", "project"] : [opts.scope];
@@ -441,39 +448,16 @@ program
       })) as Experience[];
       if (exps.length < 2) continue;
 
-      // Union-find clustering: two experiences join a cluster if their pairwise
-      // similarity ≥ threshold.
-      const parent = new Map<string, string>();
-      const find = (id: string): string => {
-        let cur = id;
-        while (parent.get(cur) && parent.get(cur) !== cur) cur = parent.get(cur)!;
-        return cur;
-      };
-      const union = (a: string, b: string) => {
-        parent.set(find(a), find(b));
-      };
-      for (const e of exps) parent.set(e.id, e.id);
-
-      const edges: { a: string; b: string; s: number }[] = [];
-      for (let i = 0; i < exps.length; i++) {
-        for (let j = i + 1; j < exps.length; j++) {
-          const s = experienceSimilarity(exps[i], exps[j]);
-          if (s >= threshold) {
-            union(exps[i].id, exps[j].id);
-            edges.push({ a: exps[i].id, b: exps[j].id, s });
-          }
-        }
+      // Produce clusters of duplicates. Lexical = local union-find; semantic = LLM grouping.
+      let clusters: Experience[][];
+      if (opts.semantic) {
+        console.log(chalk.gray(`[${scope}] asking LLM to group ${exps.length} experiences...`));
+        clusters = await semanticClusters(exps, semanticLlm!);
+      } else {
+        clusters = lexicalClusters(exps, threshold);
       }
 
-      // Group by cluster root.
-      const clusters = new Map<string, Experience[]>();
-      for (const e of exps) {
-        const root = find(e.id);
-        if (!clusters.has(root)) clusters.set(root, []);
-        clusters.get(root)!.push(e);
-      }
-
-      const multiClusters = [...clusters.values()].filter((c) => c.length > 1);
+      const multiClusters = clusters.filter((c) => c.length > 1);
       if (multiClusters.length === 0) {
         console.log(chalk.gray(`[${scope}] no duplicates found (${exps.length} experiences).`));
         continue;
@@ -489,6 +473,7 @@ program
             b.confidence - a.confidence,
         );
         const [primary, ...rest] = cluster;
+        totalDeprecated += rest.length; // count in both dry-run and apply
         console.log(
           `\n  ${chalk.green("★ keep")} ${primary.title} ${chalk.gray(`(${primary.id})`)}`,
         );
@@ -536,7 +521,6 @@ program
               needsReview: true,
               updatedAt: new Date().toISOString(),
             });
-            totalDeprecated++;
           }
         }
       }
@@ -557,6 +541,113 @@ program
       );
     }
   });
+
+// ── dedupe clustering helpers ────────────────────────────────────────
+
+/** Lexical union-find clustering on experienceSimilarity. */
+function lexicalClusters(exps: Experience[], threshold: number): Experience[][] {
+  const parent = new Map<string, string>();
+  const find = (id: string): string => {
+    let cur = id;
+    while (parent.get(cur) && parent.get(cur) !== cur) cur = parent.get(cur)!;
+    return cur;
+  };
+  const union = (a: string, b: string) => parent.set(find(a), find(b));
+  for (const e of exps) parent.set(e.id, e.id);
+  for (let i = 0; i < exps.length; i++) {
+    for (let j = i + 1; j < exps.length; j++) {
+      if (experienceSimilarity(exps[i], exps[j]) >= threshold) {
+        union(exps[i].id, exps[j].id);
+      }
+    }
+  }
+  const groups = new Map<string, Experience[]>();
+  for (const e of exps) {
+    const root = find(e.id);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root)!.push(e);
+  }
+  return [...groups.values()];
+}
+
+/**
+ * Semantic clustering: send the title list to the LLM in CHUNKS and ask it to
+ * return groups of ids that express the SAME underlying lesson (even if worded
+ * differently). Chunking keeps each call focused (LLMs return empty/garbage when
+ * given too many items at once). Cross-chunk duplicates are caught in a second
+ * pass that re-groups any experiences the LLM flagged across chunks.
+ */
+async function semanticClusters(
+  exps: Experience[],
+  llm: (prompt: string) => Promise<string>,
+): Promise<Experience[][]> {
+  const byId = new Map(exps.map((e) => [e.id, e]));
+  const CHUNK = 20;
+  const allGroups: string[][] = [];
+
+  for (let i = 0; i < exps.length; i += CHUNK) {
+    const chunk = exps.slice(i, i + CHUNK);
+    const titleList = chunk.map((e) => `${e.id}: ${e.title}`).join("\n");
+    const prompt = `You are grouping reusable "experiences" (lessons) by semantic equivalence. Below is a list (id: title). Group together any that express the SAME underlying lesson or practice — even if worded completely differently, in different languages, or at different abstraction levels.
+
+Two experiences belong in the SAME group if following either one would lead to the same action. Examples of SAME: "Use local similarity for dedup" ≈ "Pre-screen candidates with lexical similarity" ≈ "Base dedup on deterministic similarity". Examples of DIFFERENT: "Union evidence on merge" vs "Batch-deduplicate with union-find" (one is merge mechanics, one is clustering strategy).
+
+Return a JSON array of groups. Each group is an array of the FULL ids. ONLY include groups with 2+ ids. Unique experiences must be omitted entirely. Output ONLY the JSON array — no prose, no markdown fences.
+
+Experiences:
+${titleList}`;
+    const raw = await llm(prompt);
+    const jsonMatch = raw.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) continue;
+    try {
+      const groups = JSON.parse(jsonMatch[0]);
+      if (Array.isArray(groups)) {
+        for (const g of groups) {
+          if (Array.isArray(g)) allGroups.push(g.filter((id) => typeof id === "string"));
+        }
+      }
+    } catch {
+      // skip unparseable chunk
+    }
+  }
+
+  // Union-find merge across all returned groups (a chunk's group may overlap
+  // another chunk's group via a shared lesson).
+  const parent = new Map<string, string>();
+  const find = (id: string): string => {
+    if (!parent.has(id)) parent.set(id, id);
+    let cur = id;
+    while (parent.get(cur) !== cur) cur = parent.get(cur)!;
+    return cur;
+  };
+  const union = (a: string, b: string) => parent.set(find(a), find(b));
+  for (const g of allGroups) {
+    for (let i = 1; i < g.length; i++) {
+      if (byId.has(g[0]) && byId.has(g[i])) union(g[0], g[i]);
+    }
+  }
+
+  const clusters: Experience[][] = [];
+  const grouped = new Set<string>();
+  // Collect multi-member clusters first.
+  const byRoot = new Map<string, string[]>();
+  for (const g of allGroups) {
+    for (const id of g) {
+      if (byId.has(id)) byRoot.set(find(id), [...(byRoot.get(find(id)) ?? []), id]);
+    }
+  }
+  for (const [, ids] of byRoot) {
+    const uniqueIds = [...new Set(ids)].filter((id) => byId.has(id) && !grouped.has(id));
+    const members = uniqueIds.map((id) => {
+      grouped.add(id);
+      return byId.get(id)!;
+    });
+    if (members.length >= 2) clusters.push(members);
+  }
+  // Remaining experiences are singletons.
+  for (const e of exps) if (!grouped.has(e.id)) clusters.push([e]);
+  return clusters;
+}
 
 // ─── reprocess ──────────────────────────────────────
 program
