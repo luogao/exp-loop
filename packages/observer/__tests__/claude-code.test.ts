@@ -88,5 +88,39 @@ describe("ClaudeCodeIngestSource", () => {
       // sample-session has ai-title but no custom-title, so ai-title wins
       expect(session.title).toBe("Fix sidebar CSS overflow");
     });
+
+    it("reports supportsIncremental and line range on full parse", async () => {
+      expect(source.supportsIncremental).toBe(true);
+      const session = await source.parseSession({
+        id: "sample-session",
+        path: join(fixturesDir, "sample-session.jsonl"),
+      });
+      expect(session.messagesStartLine).toBe(0);
+      expect(session.messagesEndLine).toBe(8); // 8 non-empty lines consumed
+    });
+
+    it("parses only the tail when startLine is given (incremental delta)", async () => {
+      const ref = {
+        id: "sample-session",
+        path: join(fixturesDir, "sample-session.jsonl"),
+      };
+      // First, full parse to learn the line count.
+      const full = await source.parseSession(ref);
+      const watermark = full.messagesEndLine!;
+
+      // startLine beyond end of file → resets to full parse (boundary case).
+      const overflow = await source.parseSession(ref, {
+        startLine: watermark + 100,
+      });
+      expect(overflow.messages.length).toBe(full.messages.length);
+
+      // startLine in the middle → only returns tail messages.
+      const delta = await source.parseSession(ref, { startLine: 4 });
+      expect(delta.messagesStartLine).toBe(4);
+      expect(delta.messagesEndLine).toBe(8);
+      // Tail has strictly fewer messages than the full parse.
+      expect(delta.messages.length).toBeLessThan(full.messages.length);
+      expect(delta.messages.length).toBeGreaterThan(0);
+    });
   });
 });

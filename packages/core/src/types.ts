@@ -85,6 +85,32 @@ export interface ExperienceCandidate {
   applyWhen: string[];
   evidence?: string[];
   confidence: number;
+  /** LLM-provided routing hint for delta extraction (new/update/merge). */
+  routingHint?: {
+    action: "new" | "update" | "merge";
+    targetExperienceId?: string;
+    reason?: string;
+  };
+}
+
+/** Summary of an existing experience, surfaced to the extractor during delta extraction. */
+export interface ExistingExperienceSummary {
+  id: string;
+  title: string;
+  problem: string;
+  recommendation: string;
+  triggers: string[];
+  applyWhen: string[];
+}
+
+/** Context passed to the extractor to influence delta extraction + routing. */
+export interface ExtractContext {
+  isDelta?: boolean;
+  sessionId?: string;
+  /** Full same-scope experience list as compact {id,title} for semantic dedup. */
+  existingExperienceTitles?: Array<{ id: string; title: string }>;
+  /** @deprecated kept for compatibility; prefer existingExperienceTitles. */
+  existingExperiences?: ExistingExperienceSummary[];
 }
 
 // ─── Pattern ───────────────────────────────────────
@@ -233,7 +259,7 @@ export interface ExtractorConfig {
 }
 
 export interface ExpExtractor {
-  extract(episode: Episode): Promise<ExperienceCandidate[]>;
+  extract(episode: Episode, ctx?: ExtractContext): Promise<ExperienceCandidate[]>;
 }
 
 export type GuardDecision = "accept" | "reject" | "merge";
@@ -326,11 +352,16 @@ export interface AfterRunInput {
   result?: unknown;
   startedAt: string;
   endedAt: string;
+  /** True when this episode was produced from an incremental delta of a prior session. */
+  isDelta?: boolean;
+  /** Episode IDs previously extracted from the same session (for delta routing). */
+  priorEpisodeIds?: string[];
 }
 
 export interface AfterRunResult {
   episodeId: string;
   newExperiences: Experience[];
+  updatedExperiences?: Experience[];
   rejectedCandidates: { candidate: ExperienceCandidate; reason: string }[];
   updatedPatterns: Pattern[];
   skillProposals: SkillProposal[];

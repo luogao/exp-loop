@@ -1,6 +1,8 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { Layout } from "./components/Layout";
+import { useLogStore } from "./stores/logStore";
 import { Dashboard } from "./pages/Dashboard";
 import { Experiences } from "./pages/Experiences";
 import { ExperienceDetail } from "./pages/ExperienceDetail";
@@ -19,6 +21,11 @@ const queryClient = new QueryClient({
 });
 
 export default function App() {
+  useEffect(() => {
+    const cleanup = useLogStore.getState().initListeners();
+    return cleanup;
+  }, []);
+
   return (
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>

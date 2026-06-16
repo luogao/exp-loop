@@ -57,3 +57,11 @@ export { createPatternMiner } from "./pattern-miner.js";
 export { createSkillDistiller } from "./skill-distiller.js";
 export { createExpLoop } from "./runtime.js";
 export { generateId } from "./utils.js";
+export {
+  experienceSimilarity,
+  topKSimilar,
+  experienceToSimilarityInput,
+  summaryToSimilarityInput,
+  SIMILARITY_THRESHOLD,
+} from "./similarity.js";
+export type { SimilarityInput } from "./similarity.js";

@@ -18,7 +18,10 @@
   },
   "dependencies": {
     "@exp-loop/core": "workspace:*",
-    "@exp-loop/store-fs": "workspace:*"
+    "@exp-loop/store-fs": "workspace:*",
+    "chokidar": "^5.0.0"
   },
-  "files": ["dist"]
+  "files": [
+    "dist"
+  ]
 }

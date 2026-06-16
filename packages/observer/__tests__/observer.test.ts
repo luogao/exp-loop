@@ -6,8 +6,10 @@ import { createObserver } from "../src/observer.js";
 import type {
   IngestSource,
   Session,
+  SessionMessage,
   SessionRef,
   ObserverCallbacks,
+  ParseSessionOpts,
 } from "../src/types.js";
 
 function makeSession(id: string, messages: Session["messages"]): Session {
@@ -272,5 +274,135 @@ describe("createObserver", () => {
 
     const processed = await observer.listProcessed();
     expect(Object.keys(processed)).toHaveLength(3);
+  });
+
+  // ── Incremental processing ───────────────────────────────────────────
+  it("re-processes a growing session incrementally, advancing the watermark", async () => {
+    // A source backed by a mutable list of "lines", each line = one message.
+    // parseSession respects startLine and reports messagesEndLine so the observer
+    // can track a watermark.
+    let lines: SessionMessage[] = [
+      { role: "user", content: "Initial task" },
+      { role: "assistant", content: "Initial done" },
+    ];
+
+    const growingSource: IngestSource = {
+      name: "growing",
+      supportsIncremental: true,
+      async listSessions() {
+        return [makeRef("grow")];
+      },
+      async parseSession(_ref: SessionRef, opts?: ParseSessionOpts) {
+        const start = opts?.startLine ?? 0;
+        const slice = lines.slice(start);
+        const session: Session = {
+          id: "grow",
+          source: "growing",
+          messages: slice,
+          startedAt: "2026-06-01T10:00:00.000Z",
+          endedAt: "2026-06-01T10:05:00.000Z",
+          messagesStartLine: start,
+          messagesEndLine: lines.length,
+        };
+        return session;
+      },
+    };
+
+    const observer = createObserver({
+      source: growingSource,
+      dataDir,
+      llm: stubLlm,
+    });
+
+    // First pass: full parse.
+    const r1 = await observer.observe();
+    expect(r1.sessionsProcessed).toBe(1);
+    const after1 = await observer.listProcessed();
+    expect(after1["grow"].processedLineCount).toBe(2);
+    expect(after1["grow"].episodeIds).toHaveLength(1);
+
+    // Second pass with no new lines → delta is empty, watermark unchanged, no new episode.
+    const r2 = await observer.observe();
+    expect(r2.sessionsProcessed).toBe(0);
+    const after2 = await observer.listProcessed();
+    expect(after2["grow"].processedLineCount).toBe(2);
+    expect(after2["grow"].episodeIds).toHaveLength(1);
+
+    // Append new content → second observe produces a delta episode.
+    lines.push(
+      { role: "user", content: "Follow-up task" },
+      { role: "assistant", content: "Follow-up done" },
+    );
+    const r3 = await observer.observe();
+    expect(r3.sessionsProcessed).toBe(1);
+    const after3 = await observer.listProcessed();
+    expect(after3["grow"].processedLineCount).toBe(4);
+    expect(after3["grow"].episodeIds).toHaveLength(2);
+    expect(after3["grow"].lastDeltaAt).toBeTruthy();
+  });
+
+  it("does not re-process legacy records that have no watermark", async () => {
+    const sessions = new Map([
+      [
+        "legacy",
+        makeSession("legacy", [
+          { role: "user", content: "Old task" },
+          { role: "assistant", content: "Done" },
+        ]),
+      ],
+    ]);
+    // Source does NOT declare supportsIncremental → behaves like legacy.
+    const legacySource: IngestSource = {
+      name: "legacy",
+      async listSessions() {
+        return [...sessions.keys()].map((id) => makeRef(id));
+      },
+      async parseSession(ref: SessionRef) {
+        const s = sessions.get(ref.id)!;
+        return s;
+      },
+    };
+
+    const observer = createObserver({
+      source: legacySource,
+      dataDir,
+      llm: stubLlm,
+    });
+
+    await observer.observe();
+    const after1 = await observer.listProcessed();
+    expect(after1["legacy"].processedLineCount).toBeUndefined();
+
+    // Re-observe → skipped (no watermark, backwards-compatible boolean behavior).
+    const r2 = await observer.observe();
+    expect(r2.sessionsProcessed).toBe(0);
+  });
+
+  it("resetProcessed allows a session to be re-parsed", async () => {
+    const sessions = new Map([
+      [
+        "s",
+        makeSession("s", [
+          { role: "user", content: "Task" },
+          { role: "assistant", content: "Done" },
+        ]),
+      ],
+    ]);
+    const observer = createObserver({
+      source: makeMockSource(sessions),
+      dataDir,
+      llm: stubLlm,
+    });
+
+    await observer.observe();
+    expect(Object.keys(await observer.listProcessed())).toHaveLength(1);
+
+    const removed = await observer.resetProcessed("s");
+    expect(removed).toBe(true);
+    expect(Object.keys(await observer.listProcessed())).toHaveLength(0);
+
+    // Re-observe processes it again.
+    const r = await observer.observe();
+    expect(r.sessionsProcessed).toBe(1);
   });
 });

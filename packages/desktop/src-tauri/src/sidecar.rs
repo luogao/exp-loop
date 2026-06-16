@@ -66,13 +66,14 @@ pub fn start_sidecar(app: &AppHandle, state: &SidecarState) -> Result<(), String
 
     let stdin = child.stdin.take().ok_or("Failed to get stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to get stderr")?;
 
     *state.stdin_writer.lock().unwrap() = Some(stdin);
 
     let pending = state.pending.clone();
     let app_handle = app.clone();
 
-    // Stdout reader thread
+    // Stdout reader thread — JSON-RPC responses and notifications
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
@@ -98,6 +99,21 @@ pub fn start_sidecar(app: &AppHandle, state: &SidecarState) -> Result<(), String
             }
         }
     });
+
+    // Stderr reader thread — raw text lines for logging
+    {
+        let stderr_app_handle = app.clone();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                let _ = stderr_app_handle.emit("sidecar:stderr", &line);
+            }
+        });
+    }
 
     *state.child.lock().unwrap() = Some(child);
     Ok(())

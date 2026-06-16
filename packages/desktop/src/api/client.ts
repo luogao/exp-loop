@@ -15,6 +15,7 @@ import type {
   DetectedSource,
   DetectedCredential,
   DetectedProject,
+  SchedulerStatus,
 } from "./types";
 
 async function rpc<T>(method: string, params?: Record<string, unknown>): Promise<T> {
@@ -73,4 +74,9 @@ export const api = {
   },
   learn: (opts?: Record<string, unknown>) =>
     rpc<{ observe: ObserveResult; sync: SyncResult[] }>("learn", opts),
+  scheduler: {
+    start: () => rpc<SchedulerStatus>("scheduler.start"),
+    stop: () => rpc<SchedulerStatus>("scheduler.stop"),
+    status: () => rpc<SchedulerStatus>("scheduler.status"),
+  },
 };

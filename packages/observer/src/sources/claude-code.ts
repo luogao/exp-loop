@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import type {
   IngestSource,
   ListSessionsOpts,
+  ParseSessionOpts,
   SessionRef,
   Session,
   SessionMessage,
@@ -11,6 +12,7 @@ import type {
 
 export class ClaudeCodeIngestSource implements IngestSource {
   readonly name = "claude-code";
+  readonly supportsIncremental = true;
   private readonly projectsDir: string;
 
   constructor(projectsDir?: string) {
@@ -37,6 +39,7 @@ export class ClaudeCodeIngestSource implements IngestSource {
 
         try {
           const meta = await readSessionMeta(filePath);
+          const fileStat = await stat(filePath);
 
           if (opts?.projectPath && meta.cwd !== opts.projectPath) continue;
           if (opts?.after && meta.startedAt && meta.startedAt < opts.after) {
@@ -50,6 +53,7 @@ export class ClaudeCodeIngestSource implements IngestSource {
             title: meta.title,
             startedAt: meta.startedAt,
             endedAt: meta.endedAt,
+            mtimeMs: fileStat.mtimeMs,
           });
         } catch {
           continue;
@@ -68,59 +72,21 @@ export class ClaudeCodeIngestSource implements IngestSource {
     return refs;
   }
 
-  async parseSession(ref: SessionRef): Promise<Session> {
-    const content = await readFile(ref.path, "utf-8");
-    const lines = content.split("\n").filter((l) => l.trim());
+  async parseSession(ref: SessionRef, opts?: ParseSessionOpts): Promise<Session> {
+    const startLine = Math.max(0, opts?.startLine ?? 0);
+    const fileStat = await stat(ref.path).catch(() => null);
+    const totalLines = fileStat ? await countLines(ref.path, fileStat.size) : 0;
 
-    const messages: SessionMessage[] = [];
-    let title: string | undefined;
-    let firstTimestamp: string | undefined;
-    let lastTimestamp: string | undefined;
+    // Boundary case: file shrank (startLine beyond current end) → full re-parse from 0
+    const effectiveStart = startLine >= totalLines ? 0 : startLine;
+    const lines = await readLines(ref.path, effectiveStart);
 
-    for (const line of lines) {
-      let entry: Record<string, unknown>;
-      try {
-        entry = JSON.parse(line);
-      } catch {
-        continue;
-      }
+    const { messages, title, firstTimestamp, lastTimestamp, consumedLines } =
+      parseLines(lines);
 
-      const timestamp = entry.timestamp as string | undefined;
-      if (timestamp) {
-        if (!firstTimestamp) firstTimestamp = timestamp;
-        lastTimestamp = timestamp;
-      }
-
-      if (entry.isSidechain) continue;
-
-      const type = entry.type as string;
-
-      if (type === "custom-title") {
-        title = entry.customTitle as string;
-        continue;
-      }
-      if (type === "ai-title" && !title) {
-        title = entry.title as string;
-        continue;
-      }
-
-      if (type === "user") {
-        const text = extractUserContent(entry);
-        if (text) {
-          messages.push({ role: "user", content: text, timestamp });
-        }
-        continue;
-      }
-
-      if (type === "assistant") {
-        const parsed = extractAssistantContent(entry);
-        for (const msg of parsed) {
-          msg.timestamp = timestamp;
-          messages.push(msg);
-        }
-        continue;
-      }
-    }
+    // messagesStartLine/EndLine are absolute JSONL line indices in the file.
+    const messagesStartLine = effectiveStart;
+    const messagesEndLine = effectiveStart + consumedLines;
 
     return {
       id: ref.id,
@@ -128,10 +94,80 @@ export class ClaudeCodeIngestSource implements IngestSource {
       projectPath: ref.projectPath,
       title: title ?? ref.title,
       messages,
-      startedAt: firstTimestamp ?? new Date().toISOString(),
-      endedAt: lastTimestamp ?? new Date().toISOString(),
+      startedAt: firstTimestamp ?? ref.startedAt ?? new Date().toISOString(),
+      endedAt: lastTimestamp ?? ref.endedAt ?? new Date().toISOString(),
+      messagesStartLine,
+      messagesEndLine,
     };
   }
+}
+
+/**
+ * Parse an array of raw JSONL text lines into messages + metadata.
+ * Returns how many of the leading lines were consumed (non-empty/parsed).
+ */
+function parseLines(lines: string[]): {
+  messages: SessionMessage[];
+  title: string | undefined;
+  firstTimestamp: string | undefined;
+  lastTimestamp: string | undefined;
+  consumedLines: number;
+} {
+  const messages: SessionMessage[] = [];
+  let title: string | undefined;
+  let firstTimestamp: string | undefined;
+  let lastTimestamp: string | undefined;
+  let consumedLines = 0;
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    consumedLines++;
+
+    let entry: Record<string, unknown>;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    const timestamp = entry.timestamp as string | undefined;
+    if (timestamp) {
+      if (!firstTimestamp) firstTimestamp = timestamp;
+      lastTimestamp = timestamp;
+    }
+
+    if (entry.isSidechain) continue;
+
+    const type = entry.type as string;
+
+    if (type === "custom-title") {
+      title = entry.customTitle as string;
+      continue;
+    }
+    if (type === "ai-title" && !title) {
+      title = entry.title as string;
+      continue;
+    }
+
+    if (type === "user") {
+      const text = extractUserContent(entry);
+      if (text) {
+        messages.push({ role: "user", content: text, timestamp });
+      }
+      continue;
+    }
+
+    if (type === "assistant") {
+      const parsed = extractAssistantContent(entry);
+      for (const msg of parsed) {
+        msg.timestamp = timestamp;
+        messages.push(msg);
+      }
+      continue;
+    }
+  }
+
+  return { messages, title, firstTimestamp, lastTimestamp, consumedLines };
 }
 
 interface SessionMeta {
@@ -212,6 +248,83 @@ async function readHeadTail(
     const tailLines = tailRaw.slice(1).slice(-TAIL_LINES);
 
     return { headLines, tailLines };
+  } finally {
+    await fh.close();
+  }
+}
+
+/**
+ * Count total JSONL lines in a file (cheap streaming count by newline bytes).
+ */
+async function countLines(filePath: string, size: number): Promise<number> {
+  if (size === 0) return 0;
+  const fh = await open(filePath, "r");
+  try {
+    let count = 0;
+    const buf = Buffer.alloc(65536);
+    let pos = 0;
+    while (pos < size) {
+      const bytesToRead = Math.min(buf.length, size - pos);
+      await fh.read(buf, 0, bytesToRead, pos);
+      for (let i = 0; i < bytesToRead; i++) {
+        if (buf[i] === 0x0a) count++;
+      }
+      pos += bytesToRead;
+    }
+    // A trailing newline means last line still counts as a complete line;
+    // files typically end with \n, so count == number of lines.
+    return count;
+  } finally {
+    await fh.close();
+  }
+}
+
+/**
+ * Read all JSONL lines starting from `startLine` (0-based).
+ * Small files: read fully and slice. Large files: stream-skip the first
+ * `startLine` newlines, then collect the remainder.
+ */
+async function readLines(filePath: string, startLine: number): Promise<string[]> {
+  if (startLine <= 0) {
+    const content = await readFile(filePath, "utf-8");
+    return content.split("\n");
+  }
+
+  const fileStat = await stat(filePath);
+  const size = fileStat.size;
+  if (size === 0) return [];
+
+  const fh = await open(filePath, "r");
+  try {
+    const buf = Buffer.alloc(65536);
+    let pos = 0;
+    let lineCount = 0;
+    let skipUntil = -1; // byte offset where the wanted region starts
+
+    // Phase 1: scan forward counting newlines until we've passed startLine lines.
+    while (pos < size && skipUntil < 0) {
+      const bytesToRead = Math.min(buf.length, size - pos);
+      await fh.read(buf, 0, bytesToRead, pos);
+      for (let i = 0; i < bytesToRead; i++) {
+        if (buf[i] === 0x0a) {
+          lineCount++;
+          if (lineCount >= startLine) {
+            // This newline ends line (startLine-1); bytes after it begin line startLine.
+            skipUntil = pos + i + 1;
+            break;
+          }
+        }
+      }
+      pos += bytesToRead;
+    }
+
+    // If we never reached startLine (file has fewer lines), return empty.
+    if (skipUntil < 0) return [];
+
+    const remaining = size - skipUntil;
+    const tailBuf = Buffer.alloc(remaining);
+    await fh.read(tailBuf, 0, remaining, skipUntil);
+    return tailBuf.toString("utf-8").split("\n");
   } finally {
     await fh.close();
   }

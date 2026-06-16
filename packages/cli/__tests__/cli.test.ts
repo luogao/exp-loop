@@ -87,15 +87,29 @@ describe("exp-loop CLI", () => {
   });
 
   it("observe warns when no API key is set", async () => {
-    const { stdout, stderr } = await run(
-      ["observe", "--project", tmpDir, "--source", "claude-code"],
+    // Run from a temp cwd with NO .env and all key env vars cleared, so the
+    // "no API key" path is actually exercised (the project .env would otherwise
+    // supply a real key and skip the warning).
+    const { stdout, stderr } = await execFileAsync(
+      "node",
+      [CLI, "observe", "--project", tmpDir, "--source", "claude-code"],
       {
-        ANTHROPIC_API_KEY: "",
-        ANTHROPIC_AUTH_TOKEN: "",
+        cwd: tmpDir,
+        timeout: 15000,
+        env: {
+          ...process.env,
+          ANTHROPIC_API_KEY: "",
+          ANTHROPIC_AUTH_TOKEN: "",
+          CLAUDE_API_KEY: "",
+          EXP_LOOP_DATA_DIR: dataDir,
+        },
       },
+    ).then(
+      (r) => ({ stdout: r.stdout, stderr: r.stderr }),
+      (err: any) => ({ stdout: err.stdout ?? "", stderr: err.stderr ?? "" }),
     );
     const combined = stdout + stderr;
-    expect(combined).toContain("No ANTHROPIC_API_KEY");
+    expect(combined).toContain("No API key found");
   });
 
   it("skills export fails gracefully for nonexistent skill", async () => {

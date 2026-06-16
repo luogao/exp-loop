@@ -172,3 +172,19 @@ export interface SessionRef {
   projectPath?: string;
   title?: string;
 }
+
+export interface SchedulerStatus {
+  running: boolean;
+  selectedProjects: string[];
+  state?: {
+    lastCheckedAt: string;
+    lastProcessedAt: string;
+    lastProcessedSessionIds: Record<string, string>;
+    stats: {
+      totalSessionsProcessed: number;
+      totalExperiencesExtracted: number;
+      totalChecksPerformed: number;
+      totalErrors: number;
+    };
+  };
+}

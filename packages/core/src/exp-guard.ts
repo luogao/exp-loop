@@ -56,6 +56,7 @@ export function createExpGuard(config: ExpGuardConfig = {}): ExpGuard {
       const duplicate = existing.find(
         (e) =>
           e.status === "active" &&
+          e.scope === (candidate.scope ?? "global") &&
           (e.title === candidate.title ||
             titleSimilarity(e.title, candidate.title) > 0.8),
       );

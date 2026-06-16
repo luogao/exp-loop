@@ -2,8 +2,17 @@ import type { Episode, TraceStep, EpisodeStatus } from "@exp-loop/core";
 import { generateId } from "@exp-loop/core";
 import type { Session, SessionMessage } from "./types.js";
 
+export interface DeltaContext {
+  sessionId: string;
+  projectPath?: string;
+  deltaNumber: number;
+  /** [startLine, endLine] JSONL line range of this delta. */
+  lineRange: [number, number];
+}
+
 export interface SessionMapper {
   map(session: Session): Episode[];
+  mapDelta(session: Session, ctx: DeltaContext): Episode[];
 }
 
 export function createSessionMapper(): SessionMapper {
@@ -29,6 +38,42 @@ export function createSessionMapper(): SessionMapper {
         status,
         trace: { steps },
         result: extractResult(session.messages),
+        startedAt: session.startedAt,
+        endedAt: session.endedAt,
+      };
+
+      return [episode];
+    },
+
+    mapDelta(session: Session, ctx: DeltaContext): Episode[] {
+      const messages = session.messages;
+
+      // task = first user message in this delta; synthesize a continuation title if none
+      const firstUser = messages.find((m) => m.role === "user");
+      const taskDescription = firstUser
+        ? firstUser.content.slice(0, 500)
+        : `<continuation of session ${ctx.sessionId}, delta ${ctx.deltaNumber}>`;
+
+      const steps = extractTraceSteps(messages);
+      const status = inferStatus(messages);
+
+      const episode: Episode = {
+        id: generateId("ep"),
+        task: {
+          id: generateId("task"),
+          description: taskDescription,
+          metadata: {
+            sessionId: ctx.sessionId,
+            source: session.source,
+            projectPath: ctx.projectPath ?? session.projectPath,
+            isDelta: true,
+            deltaNumber: ctx.deltaNumber,
+            sourceLineRange: ctx.lineRange,
+          },
+        },
+        status,
+        trace: { steps },
+        result: extractResult(messages),
         startedAt: session.startedAt,
         endedAt: session.endedAt,
       };

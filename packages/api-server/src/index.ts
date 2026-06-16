@@ -11,7 +11,9 @@ import { observerMethods } from "./methods/observer.js";
 import { syncerMethods } from "./methods/syncer.js";
 import { configMethods } from "./methods/config.js";
 import { sourceMethods } from "./methods/sources.js";
+import { schedulerMethods } from "./methods/scheduler.js";
 import { createLlm } from "./llm.js";
+import { createLogger } from "./logger.js";
 import { ClaudeCodeIngestSource, createObserver } from "@exp-loop/observer";
 import { createClaudeMdSyncer } from "@exp-loop/syncer";
 
@@ -59,10 +61,30 @@ export async function buildServer(): Promise<ApiServer> {
     server.register(name, handler);
   }
 
+  // Scheduler methods (background auto-collection)
+  for (const [name, handler] of Object.entries(schedulerMethods(getConfig))) {
+    server.register(name, handler);
+  }
+
   // learn = observe + sync combined
   server.register("learn", async (params, emit) => {
     const cfg = getConfig();
-    const llm = await createLlm(cfg);
+    const logger = createLogger(cfg.dataDir, emit);
+
+    await logger.info("开始学习");
+
+    const llm = await createLlm(cfg, (status, detail) => {
+      if (status === "start") {
+        emit("llm.status", { status: "calling", detail });
+        logger.llm(`LLM 调用开始: ${detail}`);
+      } else if (status === "done") {
+        emit("llm.status", { status: "idle", detail });
+        logger.llm(`LLM 调用完成: ${detail}`);
+      } else {
+        emit("llm.status", { status: "error", detail });
+        logger.error(`LLM 调用失败: ${detail}`);
+      }
+    });
     const source = new ClaudeCodeIngestSource(cfg.claudeProjectsDir);
     const observer = createObserver({
       source,
@@ -71,6 +93,7 @@ export async function buildServer(): Promise<ApiServer> {
       callbacks: {
         onSessionStart(ref) {
           emit("observer.sessionStart", { ref });
+          logger.info(`处理会话: ${ref.title || ref.id}`);
         },
         onSessionComplete(ref, result) {
           emit("observer.sessionComplete", {
@@ -82,9 +105,14 @@ export async function buildServer(): Promise<ApiServer> {
               skillProposals: result.skillProposals.length,
             },
           });
+          logger.info(
+            `会话完成: ${ref.title || ref.id}`,
+            `${result.newExperiences.length} 经验, ${result.updatedPatterns.length} 模式`,
+          );
         },
         onSessionError(ref, error) {
           emit("observer.sessionError", { ref, error: error.message });
+          logger.error(`会话失败: ${ref.title || ref.id}`, error.message);
         },
       },
     });
@@ -94,10 +122,13 @@ export async function buildServer(): Promise<ApiServer> {
 
     let observeResult;
     if (explicitProject) {
+      await logger.info(`学习指定项目: ${explicitProject}`);
       observeResult = await observer.observe({ projectPath: explicitProject, after: params.after as string | undefined });
     } else if (selectedProjects.length > 0) {
+      await logger.info(`按项目学习: ${selectedProjects.length} 个项目`);
       observeResult = { sessionsProcessed: 0, episodesCreated: 0, experiencesExtracted: 0, errors: [] as { sessionId: string; error: string }[] };
       for (const project of selectedProjects) {
+        await logger.info(`开始处理项目: ${project}`);
         const r = await observer.observe({ projectPath: project, after: params.after as string | undefined });
         observeResult.sessionsProcessed += r.sessionsProcessed;
         observeResult.episodesCreated += r.episodesCreated;
@@ -107,6 +138,8 @@ export async function buildServer(): Promise<ApiServer> {
     } else {
       observeResult = await observer.observe({ after: params.after as string | undefined });
     }
+
+    await logger.info("学习完成", `${observeResult.sessionsProcessed} 个会话, ${observeResult.experiencesExtracted} 条经验`);
 
     const currentStores = createFileSystemStores(cfg.dataDir);
     const syncer = createClaudeMdSyncer({}, currentStores);

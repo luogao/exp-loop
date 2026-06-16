@@ -62,14 +62,20 @@ describe("ExpGuard", () => {
 
   it("should detect duplicate and return merge", async () => {
     const existing = [makeExperience()];
-    const result = await guard.evaluate(makeCandidate(), existing);
+    const result = await guard.evaluate(makeCandidate({ scope: "domain" }), existing);
     expect(result.decision).toBe("merge");
     expect(result.mergeTargetId).toBe("exp_test_001");
   });
 
+  it("should not merge across different scopes", async () => {
+    const existing = [makeExperience()]; // scope: "domain"
+    const result = await guard.evaluate(makeCandidate({ scope: "project" }), existing);
+    expect(result.decision).toBe("accept");
+  });
+
   it("should not merge with deprecated experiences", async () => {
     const existing = [makeExperience({ status: "deprecated" })];
-    const result = await guard.evaluate(makeCandidate(), existing);
+    const result = await guard.evaluate(makeCandidate({ scope: "domain" }), existing);
     expect(result.decision).toBe("accept");
   });
 

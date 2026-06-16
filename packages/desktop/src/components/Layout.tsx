@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { useUIStore } from "../stores/uiStore";
 import { cn } from "../lib/utils";
+import { ServerLogPanel } from "./ServerLogPanel";
 
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "仪表盘" },
@@ -68,8 +69,11 @@ export function Layout() {
           ))}
         </nav>
       </aside>
-      <main className="flex-1 overflow-auto">
-        <Outlet />
+      <main className="flex-1 flex flex-col overflow-hidden">
+        <div className="flex-1 overflow-auto">
+          <Outlet />
+        </div>
+        <ServerLogPanel />
       </main>
     </div>
   );

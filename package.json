@@ -4,8 +4,11 @@
   "type": "module",
   "scripts": {
     "build": "pnpm -r --filter '!@exp-loop/desktop' run build",
+    "exploop": "pnpm build && node packages/cli/dist/index.js",
+    "exploop:watch": "pnpm build && node packages/cli/dist/index.js watch",
     "test": "vitest run",
     "test:watch": "vitest",
+    "watch": "node packages/cli/dist/index.js watch",
     "lint": "eslint packages/*/src",
     "typecheck": "tsc -b",
     "desktop:prepare": "pnpm build && pnpm --filter @exp-loop/desktop prepare-sidecar",
@@ -18,5 +21,8 @@
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
-  "packageManager": "pnpm@9.15.0"
+  "packageManager": "pnpm@9.15.0",
+  "dependencies": {
+    "dotenv": "^17.4.2"
+  }
 }

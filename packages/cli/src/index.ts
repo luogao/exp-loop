@@ -1,8 +1,24 @@
+import { config as loadEnv } from "dotenv";
 import { Command } from "commander";
 import { resolve } from "node:path";
+import { homedir } from "node:os";
+import chalk from "chalk";
 import { createFileSystemStores } from "@exp-loop/store-fs";
 import { ClaudeCodeIngestSource, createObserver } from "@exp-loop/observer";
 import { createClaudeMdSyncer, createSkillExporter } from "@exp-loop/syncer";
+import {
+  experienceSimilarity,
+  SIMILARITY_THRESHOLD,
+  type Experience,
+} from "@exp-loop/core";
+
+// Load .env from cwd, then from home dir as fallback.
+// override: true — a project-local .env should win over ambient env vars exported
+// in the shell (e.g. an unrelated ANTHROPIC_AUTH_TOKEN), so config is explicit.
+// quiet: true — dotenv v17 prints a banner to stdout by default, which pollutes
+// CLI output (e.g. `--version`, machine-readable commands).
+loadEnv({ quiet: true, override: true });
+loadEnv({ path: resolve(homedir(), ".env"), quiet: true });
 
 const program = new Command();
 
@@ -16,15 +32,30 @@ function resolveDataDir(project?: string): string {
   return resolve(root, ".exp-loop");
 }
 
+// ─── Logging helpers ─────────────────────────────────
+function log(msg: string): void {
+  const time = new Date().toLocaleTimeString();
+  console.log(`${chalk.gray(`[${time}]`)} ${msg}`);
+}
+
+function logError(msg: string): void {
+  const time = new Date().toLocaleTimeString();
+  console.error(`${chalk.gray(`[${time}]`)} ${chalk.red("✗")} ${chalk.red(msg)}`);
+}
+
 async function createLlm(): Promise<(prompt: string) => Promise<string>> {
   const apiKey =
-    process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || "";
+    process.env.ANTHROPIC_API_KEY ||
+    process.env.ANTHROPIC_AUTH_TOKEN ||
+    process.env.CLAUDE_API_KEY ||
+    "";
   if (!apiKey) {
     console.error(
-      "Warning: No ANTHROPIC_API_KEY set. Experience extraction will be skipped.",
+      "Warning: No API key found (checked ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, CLAUDE_API_KEY). Experience extraction will be skipped.",
     );
     return async () => "[]";
   }
+  console.error(chalk.gray(`Using API key: ${apiKey.slice(0, 8)}...`));
 
   try {
     const Anthropic = (await import("@anthropic-ai/sdk")).default as any;
@@ -32,6 +63,7 @@ async function createLlm(): Promise<(prompt: string) => Promise<string>> {
     if (process.env.ANTHROPIC_BASE_URL) opts.baseURL = process.env.ANTHROPIC_BASE_URL;
     const client = new Anthropic(opts);
     const model = process.env.EXP_LOOP_LLM_MODEL || "claude-sonnet-4-20250514";
+    console.error(chalk.gray(`LLM endpoint: ${opts.baseURL ?? "default"} | model: ${model}`));
 
     return async (prompt: string): Promise<string> => {
       try {
@@ -43,11 +75,13 @@ async function createLlm(): Promise<(prompt: string) => Promise<string>> {
         const textBlock = response.content.find((b: any) => b.type === "text");
         return textBlock ? textBlock.text : "[]";
       } catch (e: any) {
-        console.error(`LLM call failed: ${e.message}`);
+        console.error(`LLM call failed: ${e?.message ?? e}`);
         return "[]";
       }
     };
-  } catch {
+  } catch (initErr: any) {
+    console.error(`LLM init failed: ${initErr?.message ?? initErr}`);
+
     return async () => "[]";
   }
 }
@@ -160,6 +194,146 @@ program
     console.log("Done.");
   });
 
+// ─── exp (browse experiences) ───────────────────────
+const exp = program.command("exp").description("Browse collected experiences");
+
+exp
+  .command("list")
+  .description("List experiences (active by default)")
+  .option("--data-dir <path>", "Data directory (default: ~/.exp-loop)")
+  .option("--scope <scope>", "Filter: global, domain, project")
+  .option("--all", "Include deprecated experiences")
+  .action(async (opts) => {
+    const dataDir = opts.dataDir || resolve(homedir(), ".exp-loop");
+    const stores = createFileSystemStores(dataDir);
+    const query: any = {};
+    if (opts.scope) query.scope = opts.scope;
+    if (!opts.all) query.status = "active";
+    const exps = await stores.experienceStore.list(query);
+
+    if (exps.length === 0) {
+      console.log(opts.all ? "No experiences found." : 'No active experiences. Use --all to include deprecated.');
+      return;
+    }
+
+    // Group by scope for readability.
+    const byScope = new Map<string, typeof exps>();
+    for (const e of exps) {
+      const k = e.scope;
+      if (!byScope.has(k)) byScope.set(k, []);
+      byScope.get(k)!.push(e);
+    }
+    for (const [scope, group] of byScope) {
+      console.log(chalk.bold.cyan(`\n[${scope}] (${group.length})`));
+      group
+        .sort((a, b) => (b.updatedAt > a.updatedAt ? 1 : -1))
+        .forEach((e, i) => {
+          const triggers = e.triggers.length
+            ? chalk.gray(`  [${e.triggers.slice(0, 4).join(", ")}]`)
+            : "";
+          const flag = e.status === "deprecated" ? chalk.red(" (deprecated)") : "";
+          console.log(`  ${chalk.gray(`${i + 1}.`)} ${e.title}${flag}${triggers}`);
+          console.log(chalk.gray(`     ${e.id}`));
+        });
+    }
+    console.log(chalk.gray(`\n${exps.length} experience(s). Use 'exp show <id>' for details, 'exp search <kw>' to filter.`));
+  });
+
+exp
+  .command("search <keyword>")
+  .description("Search experiences by keyword (title/triggers/recommendation)")
+  .option("--data-dir <path>", "Data directory (default: ~/.exp-loop)")
+  .option("--scope <scope>", "Filter: global, domain, project")
+  .option("--all", "Include deprecated experiences")
+  .action(async (keyword, opts) => {
+    const dataDir = opts.dataDir || resolve(homedir(), ".exp-loop");
+    const stores = createFileSystemStores(dataDir);
+    const query: any = {};
+    if (opts.scope) query.scope = opts.scope;
+    if (!opts.all) query.status = "active";
+    const exps = await stores.experienceStore.list(query);
+
+    const kw = keyword.toLowerCase();
+    const matches = exps.filter((e) => {
+      const hay = [
+        e.title,
+        e.problem,
+        e.recommendation,
+        ...(e.triggers ?? []),
+        ...(e.applyWhen ?? []),
+      ]
+        .join(" ")
+        .toLowerCase();
+      return hay.includes(kw);
+    });
+
+    if (matches.length === 0) {
+      console.log(`No experiences match "${keyword}".`);
+      return;
+    }
+    console.log(chalk.bold(`\n${matches.length} match(es) for "${keyword}":\n`));
+    matches.forEach((e, i) => {
+      const flag = e.status === "deprecated" ? chalk.red(" (deprecated)") : "";
+      console.log(`  ${chalk.gray(`${i + 1}.`)} ${e.title}${flag} ${chalk.gray(`[${e.scope}]`)}`);
+      console.log(chalk.gray(`     ${e.id}`));
+    });
+  });
+
+exp
+  .command("show <id>")
+  .description("Show full details of an experience by id (or list index from 'exp list')")
+  .option("--data-dir <path>", "Data directory (default: ~/.exp-loop)")
+  .action(async (id, opts) => {
+    const dataDir = opts.dataDir || resolve(homedir(), ".exp-loop");
+    const stores = createFileSystemStores(dataDir);
+
+    // Allow passing a 1-based index from `exp list` output.
+    let targetId = id;
+    if (/^\d+$/.test(id)) {
+      const query: any = { status: "active" };
+      const exps = await stores.experienceStore.list(query);
+      exps.sort((a, b) => (b.updatedAt > a.updatedAt ? 1 : -1));
+      const idx = parseInt(id, 10) - 1;
+      if (idx >= 0 && idx < exps.length) targetId = exps[idx].id;
+    }
+
+    const e = await stores.experienceStore.get(targetId);
+    if (!e) {
+      console.error(chalk.red(`Experience not found: ${id}`));
+      process.exit(1);
+    }
+
+    console.log(chalk.bold.cyan(`\n${e.title}`));
+    console.log(chalk.gray(`${e.id} · ${e.scope} · v${e.version} · ${e.status} · confidence ${e.confidence}`));
+    if (e.triggers.length) {
+      console.log(chalk.gray(`triggers: ${e.triggers.join(", ")}`));
+    }
+    console.log("");
+    console.log(chalk.bold("Problem"));
+    console.log(e.problem);
+    console.log("");
+    console.log(chalk.bold("Recommendation"));
+    console.log(e.recommendation);
+    console.log("");
+    if (e.applyWhen.length) {
+      console.log(chalk.bold("Apply When"));
+      for (const a of e.applyWhen) console.log(`  - ${a}`);
+      console.log("");
+    }
+    if (e.avoid?.length) {
+      console.log(chalk.bold("Avoid"));
+      for (const a of e.avoid) console.log(`  - ${a}`);
+      console.log("");
+    }
+    if (e.evidence?.length) {
+      console.log(chalk.bold("Evidence"));
+      for (const ev of e.evidence) console.log(`  - ${ev}`);
+      console.log("");
+    }
+    console.log(chalk.gray(`source episodes: ${e.sourceEpisodeIds.join(", ")}`));
+    console.log(chalk.gray(`updated: ${e.updatedAt}`));
+  });
+
 // ─── skills ─────────────────────────────────────────
 const skills = program.command("skills").description("Manage skills");
 
@@ -240,6 +414,311 @@ program
     console.log(`Patterns:    ${patterns.length}`);
     console.log(`  candidate: ${patterns.filter((p) => p.promotion === "candidate_skill").length}`);
     console.log(`Skills:      ${skills.length}`);
+  });
+
+// ─── dedupe ─────────────────────────────────────────
+program
+  .command("dedupe")
+  .description("Merge duplicate experiences (similar title/triggers/recommendation) within a scope")
+  .option("--data-dir <path>", "Data directory (default: ~/.exp-loop)")
+  .option("--scope <scope>", "Scope to dedupe: global, domain, project, or all", "project")
+  .option("--threshold <n>", "Similarity threshold (0-1, default 0.32)", parseFloat)
+  .option("--apply", "Actually merge (default: dry-run, just report)")
+  .action(async (opts) => {
+    const dataDir = opts.dataDir || resolve(homedir(), ".exp-loop");
+    const threshold = opts.threshold ?? SIMILARITY_THRESHOLD;
+    const stores = createFileSystemStores(dataDir);
+
+    const scopes =
+      opts.scope === "all" ? ["global", "project"] : [opts.scope];
+    let totalClusters = 0;
+    let totalDeprecated = 0;
+
+    for (const scope of scopes) {
+      const exps = (await stores.experienceStore.list({
+        scope: scope as any,
+        status: "active",
+      })) as Experience[];
+      if (exps.length < 2) continue;
+
+      // Union-find clustering: two experiences join a cluster if their pairwise
+      // similarity ≥ threshold.
+      const parent = new Map<string, string>();
+      const find = (id: string): string => {
+        let cur = id;
+        while (parent.get(cur) && parent.get(cur) !== cur) cur = parent.get(cur)!;
+        return cur;
+      };
+      const union = (a: string, b: string) => {
+        parent.set(find(a), find(b));
+      };
+      for (const e of exps) parent.set(e.id, e.id);
+
+      const edges: { a: string; b: string; s: number }[] = [];
+      for (let i = 0; i < exps.length; i++) {
+        for (let j = i + 1; j < exps.length; j++) {
+          const s = experienceSimilarity(exps[i], exps[j]);
+          if (s >= threshold) {
+            union(exps[i].id, exps[j].id);
+            edges.push({ a: exps[i].id, b: exps[j].id, s });
+          }
+        }
+      }
+
+      // Group by cluster root.
+      const clusters = new Map<string, Experience[]>();
+      for (const e of exps) {
+        const root = find(e.id);
+        if (!clusters.has(root)) clusters.set(root, []);
+        clusters.get(root)!.push(e);
+      }
+
+      const multiClusters = [...clusters.values()].filter((c) => c.length > 1);
+      if (multiClusters.length === 0) {
+        console.log(chalk.gray(`[${scope}] no duplicates found (${exps.length} experiences).`));
+        continue;
+      }
+
+      console.log(chalk.bold(`\n[${scope}] ${multiClusters.length} duplicate cluster(s):`));
+      for (const cluster of multiClusters) {
+        totalClusters++;
+        // Pick the primary: longest recommendation (most information), tie-break by confidence.
+        cluster.sort(
+          (a, b) =>
+            b.recommendation.length - a.recommendation.length ||
+            b.confidence - a.confidence,
+        );
+        const [primary, ...rest] = cluster;
+        console.log(
+          `\n  ${chalk.green("★ keep")} ${primary.title} ${chalk.gray(`(${primary.id})`)}`,
+        );
+        for (const r of rest) {
+          console.log(`    ${chalk.yellow("⊘ deprecate")} ${r.title} ${chalk.gray(`(${r.id})`)}`);
+        }
+
+        if (opts.apply) {
+          // Merge rest into primary: union sourceEpisodeIds, evidence, applyWhen, triggers.
+          const mergedSource = [
+            ...new Set([
+              ...primary.sourceEpisodeIds,
+              ...rest.flatMap((r) => r.sourceEpisodeIds),
+            ]),
+          ];
+          const mergedEvidence = [
+            ...new Set([
+              ...(primary.evidence ?? []),
+              ...rest.flatMap((r) => r.evidence ?? []),
+            ]),
+          ];
+          const mergedApplyWhen = [
+            ...new Set([
+              ...primary.applyWhen,
+              ...rest.flatMap((r) => r.applyWhen),
+            ]),
+          ];
+          const mergedTriggers = [
+            ...new Set([
+              ...primary.triggers,
+              ...rest.flatMap((r) => r.triggers),
+            ]),
+          ];
+          await stores.experienceStore.update(primary.id, {
+            sourceEpisodeIds: mergedSource,
+            evidence: mergedEvidence,
+            applyWhen: mergedApplyWhen,
+            triggers: mergedTriggers,
+            needsReview: true,
+            updatedAt: new Date().toISOString(),
+          });
+          for (const r of rest) {
+            await stores.experienceStore.update(r.id, {
+              status: "deprecated",
+              needsReview: true,
+              updatedAt: new Date().toISOString(),
+            });
+            totalDeprecated++;
+          }
+        }
+      }
+    }
+
+    console.log("");
+    if (opts.apply) {
+      console.log(
+        chalk.green(
+          `Done: merged ${totalClusters} cluster(s), deprecated ${totalDeprecated} duplicate(s).`,
+        ),
+      );
+    } else {
+      console.log(
+        chalk.gray(
+          `Dry run. ${totalDeprecated} duplicate(s) would be deprecated across ${totalClusters} cluster(s). Re-run with --apply to merge.`,
+        ),
+      );
+    }
+  });
+
+// ─── reprocess ──────────────────────────────────────
+program
+  .command("reprocess <sessionId>")
+  .description("Re-parse and re-extract a previously processed session (resets its watermark)")
+  .option("--data-dir <path>", "Data directory (default: ~/.exp-loop)")
+  .option("--project <path>", "Project path the session belongs to (faster lookup)")
+  .action(async (sessionId, opts) => {
+    const dataDir = opts.dataDir || resolve(homedir(), ".exp-loop");
+
+    const llm = await createLlm();
+    const source = new ClaudeCodeIngestSource();
+    const observer = createObserver({ source, dataDir, llm });
+
+    const existed = await observer.resetProcessed(sessionId);
+    if (existed) {
+      console.log(chalk.gray(`Reset watermark for ${sessionId}.`));
+    } else {
+      console.log(chalk.yellow(`No prior processed record for ${sessionId} — processing fresh.`));
+    }
+
+    console.log("Re-processing...");
+    const result = await observer.observe({
+      ...(opts.project ? { projectPath: resolve(opts.project) } : {}),
+    });
+
+    console.log(
+      `Done: ${result.sessionsProcessed} session(s) processed → ${result.experiencesExtracted} experiences extracted.`,
+    );
+    if (result.errors.length > 0) {
+      for (const e of result.errors) {
+        logError(`${e.sessionId}: ${e.error}`);
+      }
+      if (!result.errors.some((e) => e.sessionId === sessionId)) {
+        console.log(chalk.yellow(`(session ${sessionId} was not found / not matched)`));
+      }
+    }
+  });
+
+// ─── watch ──────────────────────────────────────────
+program
+  .command("watch")
+  .description("Watch for new Claude Code sessions and extract experiences in real-time")
+  .option("--data-dir <path>", "Data directory (default: ~/.exp-loop)")
+  .option("--project <path>", "Project path to watch (default: current directory)")
+  .action(async (opts) => {
+    const projectPath = resolve(opts.project || process.cwd());
+    const dataDir = opts.dataDir || resolve(homedir(), ".exp-loop");
+
+    console.log("");
+    console.log(
+      `${chalk.bold("exploop watch")} — watching for new sessions in ${chalk.cyan(projectPath)}`,
+    );
+    console.log(chalk.gray("Press Ctrl+C to stop"));
+    console.log("");
+
+    const llm = await createLlm();
+    const source = new ClaudeCodeIngestSource();
+
+    // Dual-threshold gate for incremental extraction (cost control):
+    //   - idleMs: only process a delta after the file has been idle this long
+    //     (so we don't extract mid-conversation)
+    //   - minDeltaLines: only process once enough new content has accumulated
+    // Defaults: 120s idle + 30 lines. Override via env for tuning.
+    const gate = {
+      idleMs: Number(process.env.EXP_LOOP_IDLE_MS ?? 120000),
+      minDeltaLines: Number(process.env.EXP_LOOP_MIN_DELTA_LINES ?? 30),
+    };
+    log(
+      chalk.gray(
+        `增量门槛: 空闲 ${gate.idleMs / 1000}s + 累积 ${gate.minDeltaLines} 行`,
+      ),
+    );
+
+    // Use observer directly — simpler and more reliable than the scheduler.
+    // No chokidar, no async watcher lifecycle — just setInterval polling.
+    const observer = createObserver({
+      source,
+      dataDir,
+      incrementalGate: gate,
+      llm: async (prompt: string) => {
+        const start = Date.now();
+        log(`${chalk.yellow("⚙")} 调用 LLM 提取经验...`);
+        const result = await llm(prompt);
+        const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+        log(`${chalk.yellow("⚙")} LLM 返回 ${result.length} 字符 (${elapsed}s)`);
+        return result;
+      },
+      callbacks: {
+        onSessionStart(ref) {
+          log(`${chalk.blue("→")} 发现新会话: ${chalk.white(ref.title || ref.id)}`);
+        },
+        onSessionDeferred(ref, reason) {
+          log(chalk.gray(`${chalk.yellow("⏳")} 暂缓处理: ${ref.id.slice(0, 8)}… (${reason})`));
+        },
+        onSessionComplete(ref, result) {
+          const expCount = result.newExperiences.length;
+          const updCount = result.updatedExperiences?.length ?? 0;
+          const patCount = result.updatedPatterns.length;
+          if (expCount > 0 || updCount > 0) {
+            log(
+              `${chalk.green("✓")} 提取 ${chalk.bold(expCount)} 条新经验, 更新 ${updCount} 条${patCount > 0 ? `, ${patCount} 个模式` : ""}`,
+            );
+            for (const exp of result.newExperiences) {
+              console.log(
+                `    ${chalk.green("•")} ${exp.title} ${chalk.gray(`(${exp.scope})`)}`,
+              );
+            }
+            for (const exp of result.updatedExperiences ?? []) {
+              console.log(
+                `    ${chalk.cyan("↻")} ${exp.title} ${chalk.gray(`(v${exp.version})`)}`,
+              );
+            }
+          } else {
+            log(`${chalk.green("✓")} 会话完成 (无新经验)`);
+          }
+        },
+        onSessionError(ref, error) {
+          logError(`会话失败: ${error.message}`);
+        },
+      },
+    });
+
+    // Stats counters
+    const stats = { sessions: 0, experiences: 0, errors: 0 };
+
+    // Run one observe pass for the selected project
+    async function runOnce(): Promise<void> {
+      const result = await observer.observe({ projectPath });
+      stats.sessions += result.sessionsProcessed;
+      stats.experiences += result.experiencesExtracted;
+      stats.errors += result.errors.length;
+    }
+
+    // Graceful shutdown
+    let stopping = false;
+    const shutdown = () => {
+      if (stopping) return;
+      stopping = true;
+      console.log("");
+      console.log(chalk.bold("已停止。本次运行:"));
+      console.log(`  处理会话: ${stats.sessions}`);
+      console.log(`  提取经验: ${stats.experiences}`);
+      console.log(`  错误: ${stats.errors}`);
+      process.exit(0);
+    };
+
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+
+    // Initial catch-up (observer's processed.json handles dedup)
+    log("检查现有未处理的会话...");
+    await runOnce();
+
+    const POLL_INTERVAL = 15000; // 15 seconds
+    log(chalk.green(`✓ 开始监听 (每${POLL_INTERVAL / 1000}秒检查新会话)`));
+    log(chalk.gray("  在另一个终端用 Claude Code 操作后，新会话会自动处理"));
+
+    // Polling interval keeps the process alive
+    setInterval(() => {
+      runOnce().catch((e) => logError(e.message));
+    }, POLL_INTERVAL);
   });
 
 program.parse();
