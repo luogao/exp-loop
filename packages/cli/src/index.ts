@@ -337,6 +337,71 @@ exp
     console.log(chalk.gray(`updated: ${e.updatedAt}`));
   });
 
+exp
+  .command("compress")
+  .description("Rewrite experiences into a compact form via LLM (fewer/shorter fields)")
+  .option("--data-dir <path>", "Data directory (default: ~/.exp-loop)")
+  .option("--scope <scope>", "Scope: global, project (default project)", "project")
+  .option("--limit <n>", "Max experiences to compress (default 30)", parseInt)
+  .option("--apply", "Actually rewrite (default: dry-run, just report size savings)")
+  .action(async (opts) => {
+    const dataDir = opts.dataDir || resolve(homedir(), ".exp-loop");
+    const stores = createFileSystemStores(dataDir);
+    const llm = await createLlm();
+
+    const exps = (await stores.experienceStore.list({
+      scope: opts.scope as any,
+      status: "active",
+    })) as Experience[];
+    const target = exps.slice(0, opts.limit ?? 30);
+    if (target.length === 0) {
+      console.log("No experiences to compress.");
+      return;
+    }
+
+    let beforeBytes = 0;
+    let afterBytes = 0;
+    let compressed = 0;
+
+    for (const e of target) {
+      const before = JSON.stringify(e).length;
+      const compact = await compressExperience(e, llm);
+      if (!compact) {
+        console.log(chalk.gray(`  ⊘ skip (LLM returned nothing): ${e.title.slice(0, 50)}`));
+        continue;
+      }
+      const after = JSON.stringify({ ...e, ...compact }).length;
+      beforeBytes += before;
+      afterBytes += after;
+      compressed++;
+      const saving = Math.round((1 - after / before) * 100);
+      console.log(
+        `  ${chalk.green("✎")} ${e.title.slice(0, 50)} ${chalk.gray(`(${before}→${after} bytes, -${saving}%)`)}`,
+      );
+      if (opts.apply) {
+        await stores.experienceStore.update(e.id, {
+          title: compact.title ?? e.title,
+          problem: compact.problem ?? e.problem,
+          recommendation: compact.recommendation ?? e.recommendation,
+          triggers: compact.triggers ?? e.triggers,
+          applyWhen: compact.applyWhen ?? e.applyWhen,
+          needsReview: true,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
+
+    console.log("");
+    if (compressed > 0) {
+      const totalSaving = Math.round((1 - afterBytes / beforeBytes) * 100);
+      console.log(
+        opts.apply
+          ? chalk.green(`Compressed ${compressed} experience(s): ${beforeBytes}→${afterBytes} bytes (-${totalSaving}%).`)
+          : chalk.gray(`Dry run. ${compressed} experience(s) would shrink ${beforeBytes}→${afterBytes} bytes (-${totalSaving}%). Re-run with --apply.`),
+      );
+    }
+  });
+
 // ─── skills ─────────────────────────────────────────
 const skills = program.command("skills").description("Manage skills");
 
@@ -647,6 +712,83 @@ ${titleList}`;
   // Remaining experiences are singletons.
   for (const e of exps) if (!grouped.has(e.id)) clusters.push([e]);
   return clusters;
+}
+
+/**
+ * Ask the LLM to rewrite one experience into a compact canonical form:
+ * short title, one-line problem, one-sentence recommendation, ≤4 triggers,
+ * ≤2 short applyWhen conditions. Preserves meaning, cuts verbosity.
+ * Returns the fields to overwrite, or null if the LLM produced nothing usable.
+ */
+async function compressExperience(
+  e: Experience,
+  llm: (prompt: string) => Promise<string>,
+): Promise<Partial<Experience> | null> {
+  const prompt = `Rewrite this experience into a COMPACT canonical form. Preserve the meaning exactly, but cut all verbosity. Keep it a POSITIVE recommendation ("Use X", "Do Y").
+
+HARD LIMITS (do not exceed):
+- title: ≤10 words
+- problem: ONE sentence, ≤100 characters
+- recommendation: ONE sentence, ≤140 characters — the single core action
+- triggers: AT MOST 4 short keywords (1-3 words each), the most discriminative
+- applyWhen: AT MOST 2 conditions, each ≤70 characters
+- drop avoid/evidence entirely
+
+Count carefully. If the original already fits, return it lightly trimmed. Return ONLY a JSON object with keys: title, problem, recommendation, triggers (array of ≤4), applyWhen (array of ≤2). No prose, no markdown fences.
+
+Original experience:
+${JSON.stringify(
+  {
+    title: e.title,
+    problem: e.problem,
+    recommendation: e.recommendation,
+    triggers: e.triggers,
+    applyWhen: e.applyWhen,
+  },
+  null,
+  2,
+)}`;
+
+  // The GLM proxy sometimes returns an empty content body for longer prompts;
+  // retry once, then fall back to local truncation.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const raw = await llm(prompt);
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) continue; // empty/non-JSON → retry
+    try {
+      const obj = JSON.parse(jsonMatch[0]);
+      const out: Partial<Experience> = {};
+      if (typeof obj.title === "string" && obj.title.trim()) out.title = obj.title.trim();
+      if (typeof obj.problem === "string" && obj.problem.trim()) out.problem = obj.problem.trim().slice(0, 120);
+      if (typeof obj.recommendation === "string" && obj.recommendation.trim())
+        out.recommendation = obj.recommendation.trim().slice(0, 160);
+      if (Array.isArray(obj.triggers))
+        out.triggers = obj.triggers.filter((t: unknown) => typeof t === "string").slice(0, 4);
+      if (Array.isArray(obj.applyWhen))
+        out.applyWhen = obj.applyWhen
+          .filter((t: unknown) => typeof t === "string")
+          .map((t: string) => t.slice(0, 80))
+          .slice(0, 2);
+      // Must have at least the core fields to be useful.
+      if (!out.recommendation) continue;
+      return out;
+    } catch {
+      continue; // parse error → retry
+    }
+  }
+  // LLM gave up — fall back to a deterministic local truncation so we still
+  // shrink the experience (just less intelligently).
+  return localTruncate(e);
+}
+
+/** Deterministic size reduction when the LLM is unavailable/unreliable. */
+function localTruncate(e: Experience): Partial<Experience> {
+  return {
+    problem: e.problem.slice(0, 120),
+    recommendation: e.recommendation.slice(0, 160),
+    triggers: e.triggers.slice(0, 4),
+    applyWhen: e.applyWhen.slice(0, 2).map((s) => s.slice(0, 80)),
+  };
 }
 
 // ─── reprocess ──────────────────────────────────────
